@@ -1,0 +1,14 @@
+# Daftar ticker IDX yang mau di-screening, satu ticker per baris.
+# Baris kosong / diawali # diabaikan. Suffix .JK opsional (otomatis ditambahkan).
+#
+# INI CUMA CONTOH -- ganti dengan universe lengkap kamu (mis. export dari
+# infrastruktur idx_closing_spike_scanner.py yang sudah ada).
+BBCA
+BBRI
+TLKM
+ASII
+TOWR
+ISAT
+INDY
+KIJA
+COCO

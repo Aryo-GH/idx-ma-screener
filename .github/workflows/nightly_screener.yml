@@ -1,0 +1,65 @@
+name: IDX MA Setup Screener - Nightly
+
+on:
+  schedule:
+    # 15:30 UTC = 22:30 WIB, Senin-Jumat (setelah bursa IDX tutup & data EOD settle)
+    # Catatan: jadwal GitHub Actions bisa meleset beberapa menit saat traffic tinggi,
+    # jadi ini "sekitar jam segitu", bukan presisi ke detik.
+    - cron: "30 15 * * 1-5"
+  workflow_dispatch: {}   # supaya bisa dipicu manual dari tab Actions, buat testing
+
+permissions:
+  contents: write   # perlu ini kalau mau commit hasil balik ke repo (langkah terakhir)
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pandas yfinance requests
+
+      - name: Jalankan screener
+        run: |
+          mkdir -p results
+          python scripts/idx_ma_setup_screener.py \
+            --tickers-file data/idx_universe.txt \
+            --period 6mo \
+            --min-score 60 \
+            --top 30 \
+            --sleep 0.3 \
+            --output results/latest.csv
+
+      - name: Kirim laporan ke Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scripts/send_telegram_report.py \
+            --csv results/latest.csv \
+            --min-score 60 \
+            --top 15
+
+      - name: Simpan hasil sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-results-${{ github.run_number }}
+          path: results/latest.csv
+          retention-days: 30
+
+      - name: Commit hasil ke repo (riwayat harian, opsional)
+        run: |
+          git config user.name "idx-screener-bot"
+          git config user.email "actions@users.noreply.github.com"
+          mkdir -p results/history
+          cp results/latest.csv "results/history/$(date -u +'%Y-%m-%d').csv"
+          git add results/latest.csv results/history/
+          git commit -m "Update screener results $(date -u +'%Y-%m-%d')" || echo "Tidak ada perubahan untuk di-commit"
+          git push
