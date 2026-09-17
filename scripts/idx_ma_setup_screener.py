@@ -402,6 +402,19 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
     if not liquid_ok:
         return None  # caller akan print skip message
 
+    last = df.iloc[-1]
+
+    # Gate "fanning out" #1: close harus masih di atas MA20 saat screening.
+    # Kalau harga sudah balik ke bawah MA20, setup sudah rusak (catches MDKA).
+    if pd.notna(last["MA20"]) and last["Close"] < last["MA20"]:
+        return None
+
+    # Gate "fanning out" #2: MA5 harus jelas di atas MA20 (min 1% separation).
+    # MA5 yang hampir sama dengan MA20 berarti MAs belum "fanning out" --
+    # bisa jadi saham masih di tengah downtrend panjang (catches PGEO).
+    if pd.notna(last["MA5"]) and pd.notna(last["MA20"]) and last["MA5"] < last["MA20"] * 1.01:
+        return None
+
     breakout_idx = find_breakout(df, lookback, cfg)
 
     a, note_a = score_breakout_structure(df, breakout_idx, cfg)
@@ -415,7 +428,6 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
     candles_since = (len(df) - 1 - breakout_idx) if breakout_idx is not None else None
     total, stale_note = apply_staleness_penalty(raw_total, candles_since, cfg)
 
-    last = df.iloc[-1]
     avg_val_b = round(last["AvgValue20"] / 1e9, 2) if pd.notna(last["AvgValue20"]) else None
     notes_parts = [note_a, note_b, note_c, note_d]
     if stale_note:
