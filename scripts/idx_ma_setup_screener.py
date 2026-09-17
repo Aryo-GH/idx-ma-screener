@@ -67,6 +67,11 @@ class ScoringConfig:
     CORR_BODY_BAD: float = 1.2
     CORR_VOL_GOOD: float = 0.5
     CORR_VOL_BAD: float = 1.0
+    # Gate B -- koreksi disqualified kalau:
+    # (1) ada candle merah dengan body > X kali body breakout ("full candle merah")
+    CORR_RED_BODY_MAX: float = 0.5   # body merah > 50% body breakout = jelek
+    # (2) close jatuh lebih dari X% di bawah MA5 ("terlalu jauh dari MA5")
+    CORR_MAX_BELOW_MA5_PCT: float = 7.0  # toleransi 7% di bawah MA5
 
     # Komponen C: jarak (%) close vs MA5
     MA5_IDEAL_ABOVE_PCT: float = 2.0
@@ -204,12 +209,19 @@ def check_liquidity(df: pd.DataFrame, cfg: ScoringConfig) -> tuple[bool, str]:
 # Deteksi breakout
 # ---------------------------------------------------------------------------
 def find_breakout(df: pd.DataFrame, lookback: int, cfg: ScoringConfig):
-    """Cari index candle breakout paling baru dalam `lookback` candle terakhir:
+    """Cari index candle breakout paling baru dalam `lookback` candle terakhir.
+
+    Syarat breakout yang valid (framework "satu full candle hijau besar, lalu retrace tertahan"):
+    - candle HIJAU (close > open) -- bukan candle merah/doji
     - close menembus ke atas MA20 (crossover dari <= ke >)
     - body candle >= MIN_BODY_MULT x rata-rata body 20 candle
     - volume >= MIN_VOL_MULT x rata-rata volume 20 candle
+    - MA20 tidak sedang turun tajam saat breakout (slope MA20 10 candle >= -2%)
+      --> filter saham yang "mantul" sementara di tengah downtrend panjang
+
     Return None kalau tidak ketemu.
     """
+    MA20_SLOPE_LOOKBACK = 10  # candle lookback untuk cek arah MA20
     n = len(df)
     # 20 = jumlah minimum candle sebelumnya supaya MA20/AvgBody20/AvgVol20 valid,
     # BUKAN cfg.MIN_HISTORY (itu syarat total panjang data, beda tujuan)
@@ -218,11 +230,26 @@ def find_breakout(df: pd.DataFrame, lookback: int, cfg: ScoringConfig):
         row, prev = df.iloc[i], df.iloc[i - 1]
         if pd.isna(row["MA20"]) or pd.isna(row["AvgBody20"]) or pd.isna(row["AvgVol20"]):
             continue
+
+        # 1. Harus candle hijau (close > open)
+        green_candle = row["Close"] > row["Open"]
+
+        # 2. Crossover: kemarin di bawah MA20, hari ini di atas
         crossed = prev["Close"] <= prev["MA20"] and row["Close"] > row["MA20"]
-        body = abs(row["Close"] - row["Open"])
+
+        # 3. Body dan volume besar
+        body = row["Close"] - row["Open"]  # positif karena green_candle
         body_ok = row["AvgBody20"] > 0 and body >= cfg.MIN_BODY_MULT * row["AvgBody20"]
         vol_ok = row["AvgVol20"] > 0 and row["Volume"] >= cfg.MIN_VOL_MULT * row["AvgVol20"]
-        if crossed and body_ok and vol_ok:
+
+        # 4. MA20 tidak dalam downtrend tajam (slope >= -2% dari 10 candle lalu)
+        if i >= MA20_SLOPE_LOOKBACK:
+            ma20_ago = df.iloc[i - MA20_SLOPE_LOOKBACK]["MA20"]
+            ma20_slope_ok = pd.isna(ma20_ago) or row["MA20"] >= ma20_ago * 0.98
+        else:
+            ma20_slope_ok = True
+
+        if crossed and body_ok and vol_ok and green_candle and ma20_slope_ok:
             return i
     return None
 
@@ -238,7 +265,7 @@ def score_breakout_structure(df, breakout_idx, cfg: ScoringConfig):
         return 0.0, "Belum breakout dari MA20 (masih di bawah/menekan)"
 
     row = df.iloc[breakout_idx]
-    body = abs(row["Close"] - row["Open"])
+    body = row["Close"] - row["Open"]  # positif (green candle sudah dijamin find_breakout)
     body_ratio = body / row["AvgBody20"] if row["AvgBody20"] > 0 else 0.0
     vol_ratio = row["Volume"] / row["AvgVol20"] if row["AvgVol20"] > 0 else 0.0
     body_q = linear_score(body_ratio, cfg.MIN_BODY_MULT, cfg.STRONG_BODY_MULT)
@@ -256,7 +283,24 @@ def score_correction_quality(df, breakout_idx, cfg: ScoringConfig):
         return cfg.WEIGHT_B * 0.5, "Belum ada candle koreksi (baru saja breakout)"
 
     breakout_row = df.iloc[breakout_idx]
-    breakout_body = abs(breakout_row["Close"] - breakout_row["Open"])
+    breakout_body = breakout_row["Close"] - breakout_row["Open"]  # green candle, positif
+
+    # Gate 1: tidak boleh ada "full candle merah" besar saat koreksi.
+    # Full candle merah = candle merah dengan body > CORR_RED_BODY_MAX * body breakout.
+    big_red_threshold = breakout_body * cfg.CORR_RED_BODY_MAX
+    for ts, cr in corr.iterrows():
+        red_body = cr["Open"] - cr["Close"]  # positif kalau merah, negatif kalau hijau
+        if red_body > big_red_threshold:
+            return 0.0, f"Koreksi ada full candle merah besar pada {ts.date()} (body {red_body:.0f} vs threshold {big_red_threshold:.0f})"
+
+    # Gate 2: harga tidak boleh jatuh terlalu jauh di bawah MA5 ("sekitar MA5").
+    # Boleh sedikit di bawah MA5, tapi tidak lebih dari CORR_MAX_BELOW_MA5_PCT.
+    for ts, cr in corr.iterrows():
+        if pd.isna(cr["MA5"]) or cr["MA5"] == 0:
+            continue
+        floor = cr["MA5"] * (1 - cfg.CORR_MAX_BELOW_MA5_PCT / 100)
+        if cr["Close"] < floor:
+            return 0.0, f"Koreksi terlalu jauh di bawah MA5 pada {ts.date()} (close {cr['Close']:.0f} vs MA5 {cr['MA5']:.0f})"
     breakout_vol = breakout_row["Volume"]
     avg_corr_body = (corr["Close"] - corr["Open"]).abs().mean()
     avg_corr_vol = corr["Volume"].mean()
@@ -266,7 +310,7 @@ def score_correction_quality(df, breakout_idx, cfg: ScoringConfig):
     body_q = 1 - linear_score(body_ratio, cfg.CORR_BODY_GOOD, cfg.CORR_BODY_BAD)
     vol_q = 1 - linear_score(vol_ratio, cfg.CORR_VOL_GOOD, cfg.CORR_VOL_BAD)
     quality = clamp(0.5 * body_q + 0.5 * vol_q)
-    note = f"Koreksi body={body_ratio:.2f}x, vol={vol_ratio:.2f}x candle breakout ({len(corr)} candle)"
+    note = f"Koreksi tertahan di atas MA20, body={body_ratio:.2f}x, vol={vol_ratio:.2f}x breakout ({len(corr)} candle)"
     return quality * cfg.WEIGHT_B, note
 
 
