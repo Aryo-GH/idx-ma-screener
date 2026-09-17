@@ -5,7 +5,7 @@ on:
     # 15:30 UTC = 22:30 WIB, Senin-Jumat (setelah bursa IDX tutup & data EOD settle)
     # Catatan: jadwal GitHub Actions bisa meleset beberapa menit saat traffic tinggi,
     # jadi ini "sekitar jam segitu", bukan presisi ke detik.
-    - cron: "30 15 * * 1-5"
+    - cron: '0 12 * * 1-5'
   workflow_dispatch: {}   # supaya bisa dipicu manual dari tab Actions, buat testing
 
 permissions:
