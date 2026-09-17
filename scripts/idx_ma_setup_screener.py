@@ -85,9 +85,9 @@ class ScoringConfig:
 
     # Liquidity filter -- saham yang tidak memenuhi threshold ini di-skip sepenuhnya.
     # Dihitung dari rata-rata 20 candle terakhir. Set 0 untuk disable.
-    MIN_AVG_VALUE: float = 1_000_000_000  # avg value traded/hari (IDR), default 1 miliar
+    MIN_AVG_VALUE: float = 5_000_000_000  # avg value traded/hari (IDR), default 5 miliar
     MIN_AVG_VOLUME: float = 0             # avg volume/hari (lembar), default off
-    MIN_PRICE: float = 50                 # min last close (IDR), default 50
+    MIN_PRICE: float = 100                # min last close (IDR), default 100
 
 
 # ---------------------------------------------------------------------------
