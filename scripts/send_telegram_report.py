@@ -2,93 +2,167 @@
 """
 send_telegram_report.py
 
-Baca hasil screener (CSV output dari idx_ma_setup_screener.py) dan kirim
-ringkasan ke Telegram lewat Bot API.
+Kirim hasil screener IDX ke Telegram.
+Baca CSV dari hasil idx_ma_setup_screener.py, format jadi pesan ringkas.
 
-ENV VARS (atau lewat --token / --chat-id):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-
-CONTOH:
-    python send_telegram_report.py --csv results/latest.csv --min-score 60 --top 15
+Env vars yang dibutuhkan (set di GitHub Secrets):
+  TELEGRAM_BOT_TOKEN  -- token dari BotFather
+  TELEGRAM_CHAT_ID    -- chat ID tujuan (dapat dari getUpdates)
 """
-
-from __future__ import annotations
 
 import argparse
 import os
 import sys
+from datetime import date
 
 import pandas as pd
 import requests
 
-TELEGRAM_MSG_LIMIT = 4096
 
-
-def format_report(df: pd.DataFrame, min_score: float, top: int) -> list[str]:
-    """Ubah DataFrame hasil screener jadi satu atau beberapa teks pesan Telegram
-    (dipecah otomatis kalau kepanjangan dari limit 4096 karakter Telegram)."""
-    filtered = df[df["score_total"] >= min_score].sort_values("score_total", ascending=False).head(top)
-
-    if filtered.empty:
-        return [f"\U0001F4CA *Laporan Screener IDX*\n\nTidak ada saham dengan skor >= {min_score} hari ini."]
-
-    header = f"\U0001F4CA *Laporan Screener IDX* -- {len(filtered)} saham skor >= {min_score:g}"
-    blocks = [header]
-    for _, row in filtered.iterrows():
-        breakout_note = f" | Breakout {row['breakout_date']}" if pd.notna(row.get("breakout_date")) else ""
-        blocks.append(
-            f"*{row['ticker']}* -- skor {row['score_total']:.0f}\n"
-            f"  A:{row['score_A_breakout']:.0f}  B:{row['score_B_correction']:.0f}  "
-            f"C:{row['score_C_ma5_position']:.0f}  D:{row['score_D_trend_momentum']:.0f}\n"
-            f"  Close {row['last_close']:.0f} | MA5 {row['ma5']:.0f} | MA20 {row['ma20']:.0f}{breakout_note}"
+# ---------------------------------------------------------------------------
+# Telegram helpers
+# ---------------------------------------------------------------------------
+def tg_send(token: str, chat_id: str, text: str):
+    """Kirim pesan ke Telegram, auto-split kalau >4096 karakter."""
+    for i in range(0, len(text), 4096):
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text[i : i + 4096],
+                "parse_mode": "Markdown",
+            },
+            timeout=30,
         )
-
-    # Pecah jadi beberapa pesan kalau melebihi batas panjang Telegram
-    chunks: list[str] = []
-    current = ""
-    for block in blocks:
-        candidate = f"{current}\n\n{block}" if current else block
-        if len(candidate) > TELEGRAM_MSG_LIMIT:
-            chunks.append(current)
-            current = block
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
-    return chunks
+        if not resp.ok:
+            print(f"[warn] Telegram error: {resp.status_code} {resp.text[:200]}")
 
 
-def send_telegram_message(token: str, chat_id: str, text: str) -> dict:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
+# ---------------------------------------------------------------------------
+# Format laporan
+# ---------------------------------------------------------------------------
+def fmt_date_short(iso_str) -> str:
+    """'2026-09-17' -> '17 Sep 2026'"""
+    if not iso_str or str(iso_str) in ("", "nan", "None", "NaT"):
+        return "?"
+    try:
+        d = date.fromisoformat(str(iso_str)[:10])
+        return d.strftime("%-d %b %Y")  # e.g. "17 Sep 2026"
+    except Exception:
+        return str(iso_str)[:10]
 
 
+def fmt_date_breakout(iso_str) -> str:
+    """'2026-09-15' -> '15 Sep'"""
+    if not iso_str or str(iso_str) in ("", "nan", "None", "NaT"):
+        return "?"
+    try:
+        d = date.fromisoformat(str(iso_str)[:10])
+        return d.strftime("%-d %b")
+    except Exception:
+        return str(iso_str)[:10]
+
+
+def build_report(df: pd.DataFrame, min_score: float, top: int, run_date: str) -> str:
+    filtered = df[df["score_total"] >= min_score].head(top)
+    total_scanned = len(df)
+
+    header = (
+        f"📊 *Laporan Screener IDX*\n"
+        f"Data: {fmt_date_short(run_date)} | "
+        f"{len(filtered)} setup skor ≥{min_score:.0f} "
+        f"(dari {total_scanned} saham diproses)\n"
+        f"{'─' * 30}"
+    )
+
+    blocks = [header]
+
+    for _, row in filtered.iterrows():
+        ticker    = str(row.get("ticker", "?")).upper()
+        score     = int(row.get("score_total", 0))
+        score_raw = row.get("score_raw", None)
+        a = int(row.get("score_A_breakout", 0))
+        b = int(row.get("score_B_correction", 0))
+        c = int(row.get("score_C_ma5_position", 0))
+        d = int(row.get("score_D_trend_momentum", 0))
+
+        close   = row.get("last_close", None)
+        as_of   = row.get("as_of", None)
+        ma5     = row.get("ma5", None)
+        ma20    = row.get("ma20", None)
+        bo_date = row.get("breakout_date", None)
+        avg_val = row.get("avg_daily_value_B", None)
+        candles = row.get("candles_since_breakout", None)
+
+        # Format values
+        close_str = f"{close:.0f}" if close is not None and pd.notna(close) else "?"
+        as_of_str = fmt_date_short(as_of)   # tanggal data terakhir (untuk verifikasi)
+        ma5_str   = f"{ma5:.0f}"  if ma5  is not None and pd.notna(ma5)  else "?"
+        ma20_str  = f"{ma20:.0f}" if ma20 is not None and pd.notna(ma20) else "?"
+        bo_str    = fmt_date_breakout(bo_date)
+
+        val_str   = f"{avg_val:.1f}M/hr" if avg_val is not None and pd.notna(avg_val) else "-"
+        stale_str = f" | {int(candles)}c lalu" if candles is not None and pd.notna(candles) else ""
+
+        # Penanda kalau skor sudah kena staleness penalty
+        penalty_note = ""
+        if score_raw is not None and pd.notna(score_raw) and float(score_raw) > score:
+            penalty_note = f" _(raw {int(score_raw)})_"
+
+        block = (
+            f"\n*{ticker}* — skor *{score}*{penalty_note}\n"
+            f"A:{a} B:{b} C:{c} D:{d}\n"
+            f"Close *{close_str}* (data {as_of_str}) | MA5 {ma5_str} | MA20 {ma20_str}\n"
+            f"Breakout: {bo_str}{stale_str} | Likuiditas: {val_str}"
+        )
+        blocks.append(block)
+
+    return "\n".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Kirim laporan hasil screener IDX ke Telegram")
-    parser.add_argument("--csv", required=True, help="Path CSV hasil idx_ma_setup_screener.py")
-    parser.add_argument("--min-score", type=float, default=60.0, help="Ambang skor yang ditampilkan (default 60)")
-    parser.add_argument("--top", type=int, default=15, help="Jumlah saham teratas yang dikirim (default 15)")
-    parser.add_argument("--token", default=os.environ.get("TELEGRAM_BOT_TOKEN"),
-                         help="Bot token (default: env TELEGRAM_BOT_TOKEN)")
-    parser.add_argument("--chat-id", default=os.environ.get("TELEGRAM_CHAT_ID"),
-                         help="Chat id tujuan (default: env TELEGRAM_CHAT_ID)")
+    parser = argparse.ArgumentParser(
+        description="Kirim hasil screener IDX ke Telegram."
+    )
+    parser.add_argument("--csv", required=True, help="Path ke CSV hasil screener")
+    parser.add_argument("--min-score", type=float, default=60.0,
+                        help="Hanya kirim saham dengan skor >= nilai ini (default 60)")
+    parser.add_argument("--top", type=int, default=15,
+                        help="Jumlah saham teratas yang dikirim (default 15)")
     args = parser.parse_args()
 
-    if not args.token or not args.chat_id:
-        print("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum diisi (env var atau --token/--chat-id).",
-              file=sys.stderr)
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    if not token or not chat_id:
+        print("[error] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID tidak di-set di environment.")
         sys.exit(1)
 
-    df = pd.read_csv(args.csv)
-    chunks = format_report(df, args.min_score, args.top)
+    try:
+        df = pd.read_csv(args.csv)
+    except Exception as exc:
+        print(f"[error] Gagal baca CSV {args.csv}: {exc}")
+        sys.exit(1)
 
-    for chunk in chunks:
-        send_telegram_message(args.token, args.chat_id, chunk)
+    # as_of dari baris pertama (semua saham di-screen pada hari yang sama)
+    run_date = df["as_of"].iloc[0] if "as_of" in df.columns and not df.empty else ""
 
-    print(f"Terkirim {len(chunks)} pesan ke Telegram.")
+    if df.empty or df["score_total"].max() < args.min_score:
+        tg_send(
+            token, chat_id,
+            f"📊 Screener IDX ({fmt_date_short(run_date)}): tidak ada setup yang memenuhi syarat hari ini."
+        )
+        print("Tidak ada saham yang lolos filter, pesan kosong dikirim.")
+        return
+
+    msg = build_report(df, args.min_score, args.top, run_date)
+    tg_send(token, chat_id, msg)
+
+    n_sent = len(df[df["score_total"] >= args.min_score].head(args.top))
+    print(f"Laporan terkirim: {n_sent} saham (data: {run_date})")
 
 
 if __name__ == "__main__":
