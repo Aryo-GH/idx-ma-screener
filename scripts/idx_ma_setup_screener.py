@@ -76,6 +76,19 @@ class ScoringConfig:
     # Komponen D: level Stoch RSI %K (14,14,3,3)
     STOCH_OB_START: float = 70.0
 
+    # Staleness penalty: setup ideal terjadi dalam ~5 candle setelah breakout.
+    # Setelah STALE_CANDLES, skor mulai diturunkan. Setelah MAX_CANDLES,
+    # skor total dikunci maksimal MAX_STALE_SCORE.
+    STALE_CANDLES: int = 7        # mulai kena penalty setelah sekian candle
+    MAX_CANDLES: int = 15         # di atas ini skor dikunci <= MAX_STALE_SCORE
+    MAX_STALE_SCORE: float = 60.0 # batas atas skor kalau breakout sudah terlalu lama
+
+    # Liquidity filter -- saham yang tidak memenuhi threshold ini di-skip sepenuhnya.
+    # Dihitung dari rata-rata 20 candle terakhir. Set 0 untuk disable.
+    MIN_AVG_VALUE: float = 1_000_000_000  # avg value traded/hari (IDR), default 1 miliar
+    MIN_AVG_VOLUME: float = 0             # avg volume/hari (lembar), default off
+    MIN_PRICE: float = 50                 # min last close (IDR), default 50
+
 
 # ---------------------------------------------------------------------------
 # Util
@@ -154,8 +167,37 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Body"] = (df["Close"] - df["Open"]).abs()
     df["AvgBody20"] = df["Body"].rolling(20).mean()
     df["AvgVol20"] = df["Volume"].rolling(20).mean()
+    df["Value"] = df["Close"] * df["Volume"]           # value traded per candle (IDR)
+    df["AvgValue20"] = df["Value"].rolling(20).mean()  # rata-rata 20 candle
     df["StochK"], df["StochD"] = _stoch_rsi(df["Close"])
     return df
+
+
+def check_liquidity(df: pd.DataFrame, cfg: ScoringConfig) -> tuple[bool, str]:
+    """Return (lolos, keterangan). Kalau False, saham di-skip dari hasil."""
+    last = df.iloc[-1]
+    close = last["Close"]
+    avg_vol = last["AvgVol20"]
+    avg_val = last["AvgValue20"]
+
+    reasons = []
+
+    if cfg.MIN_PRICE > 0 and (pd.isna(close) or close < cfg.MIN_PRICE):
+        reasons.append(f"harga {close:.0f} < min {cfg.MIN_PRICE:.0f}")
+
+    if cfg.MIN_AVG_VOLUME > 0 and (pd.isna(avg_vol) or avg_vol < cfg.MIN_AVG_VOLUME):
+        reasons.append(f"avg vol {avg_vol/1e6:.1f}jt lembar < min {cfg.MIN_AVG_VOLUME/1e6:.0f}jt")
+
+    if cfg.MIN_AVG_VALUE > 0 and (pd.isna(avg_val) or avg_val < cfg.MIN_AVG_VALUE):
+        val_b = avg_val / 1e9 if pd.notna(avg_val) else 0
+        min_b = cfg.MIN_AVG_VALUE / 1e9
+        reasons.append(f"avg value {val_b:.2f}M < min {min_b:.1f}M")
+
+    if reasons:
+        return False, "ILLIQUID: " + "; ".join(reasons)
+
+    val_b = avg_val / 1e9 if pd.notna(avg_val) else 0
+    return True, f"liquid (avg {val_b:.1f}M/hari, close {close:.0f})"
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +315,36 @@ def score_trend_momentum(df, cfg: ScoringConfig):
 
 
 # ---------------------------------------------------------------------------
+# Staleness penalty
+# ---------------------------------------------------------------------------
+def apply_staleness_penalty(total: float, candles_since_breakout: int | None,
+                             cfg: ScoringConfig) -> tuple[float, str]:
+    """Turunkan skor kalau breakout sudah terlalu lama.
+
+    - 0..STALE_CANDLES   : tidak ada penalty
+    - STALE_CANDLES..MAX_CANDLES : penalty linear (skor dikali faktor turun)
+    - > MAX_CANDLES      : skor dikunci maks MAX_STALE_SCORE
+    """
+    if candles_since_breakout is None:
+        return total, ""
+
+    n = candles_since_breakout
+    if n <= cfg.STALE_CANDLES:
+        return total, f"fresh ({n}c sejak breakout)"
+
+    if n >= cfg.MAX_CANDLES:
+        penalized = min(total, cfg.MAX_STALE_SCORE)
+        return round(penalized, 1), f"STALE ({n}c sejak breakout, skor dikunci <={cfg.MAX_STALE_SCORE:.0f})"
+
+    # Linear: dari 1.0 di STALE_CANDLES turun ke MAX_STALE_SCORE/100 di MAX_CANDLES
+    t = (n - cfg.STALE_CANDLES) / (cfg.MAX_CANDLES - cfg.STALE_CANDLES)
+    floor_ratio = cfg.MAX_STALE_SCORE / 100.0
+    factor = 1.0 - t * (1.0 - floor_ratio)
+    penalized = total * factor
+    return round(penalized, 1), f"agak stale ({n}c sejak breakout, penalty {factor:.2f}x)"
+
+
+# ---------------------------------------------------------------------------
 # Skor total per saham
 # ---------------------------------------------------------------------------
 def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
@@ -280,6 +352,12 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
         return None  # data terlalu pendek
 
     df = compute_indicators(raw_df)
+
+    # Liquidity gate -- return None kalau tidak liquid (akan di-skip)
+    liquid_ok, liquid_note = check_liquidity(df, cfg)
+    if not liquid_ok:
+        return None  # caller akan print skip message
+
     breakout_idx = find_breakout(df, lookback, cfg)
 
     a, note_a = score_breakout_structure(df, breakout_idx, cfg)
@@ -287,19 +365,32 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
     c, note_c = score_ma5_position(df.iloc[-1], cfg)
     d, note_d = score_trend_momentum(df, cfg)
 
-    total = round(a + b + c + d, 1)
+    raw_total = a + b + c + d
+
+    # Hitung candle sejak breakout
+    candles_since = (len(df) - 1 - breakout_idx) if breakout_idx is not None else None
+    total, stale_note = apply_staleness_penalty(raw_total, candles_since, cfg)
+
     last = df.iloc[-1]
+    avg_val_b = round(last["AvgValue20"] / 1e9, 2) if pd.notna(last["AvgValue20"]) else None
+    notes_parts = [note_a, note_b, note_c, note_d]
+    if stale_note:
+        notes_parts.append(stale_note)
+
     return {
         "score_total": total,
+        "score_raw": round(raw_total, 1),
         "score_A_breakout": round(a, 1),
         "score_B_correction": round(b, 1),
         "score_C_ma5_position": round(c, 1),
         "score_D_trend_momentum": round(d, 1),
+        "candles_since_breakout": candles_since,
+        "avg_daily_value_B": avg_val_b,   # dalam miliar IDR
         "breakout_date": df.index[breakout_idx].date().isoformat() if breakout_idx is not None else None,
         "last_close": round(last["Close"], 2),
         "ma5": round(last["MA5"], 2) if pd.notna(last["MA5"]) else None,
         "ma20": round(last["MA20"], 2) if pd.notna(last["MA20"]) else None,
-        "notes": " | ".join([note_a, note_b, note_c, note_d]),
+        "notes": " | ".join(notes_parts),
     }
 
 
@@ -322,8 +413,14 @@ def screen_universe(tickers: list[str], lookback: int, cfg: ScoringConfig,
                     continue
             result = score_stock(raw_df, cfg, lookback)
             if result is None:
-                print(f"[skip] {ticker}: data kurang dari {cfg.MIN_HISTORY} candle "
-                      f"(dapat {len(raw_df)}) -- coba --period lebih panjang")
+                # Bisa karena data pendek ATAU tidak liquid -- cek dulu panjang data
+                if len(raw_df) < cfg.MIN_HISTORY:
+                    print(f"[skip] {ticker}: data kurang ({len(raw_df)} candle)")
+                else:
+                    # Hitung ulang untuk dapat pesan liquidity
+                    df_tmp = compute_indicators(raw_df)
+                    _, liq_msg = check_liquidity(df_tmp, cfg)
+                    print(f"[skip] {ticker}: {liq_msg}")
                 continue
             result["ticker"] = ticker.upper()
             result["as_of"] = raw_df.index[-1].date().isoformat()
@@ -337,8 +434,10 @@ def screen_universe(tickers: list[str], lookback: int, cfg: ScoringConfig,
         return pd.DataFrame()
 
     cols_order = [
-        "ticker", "as_of", "score_total", "score_A_breakout", "score_B_correction",
+        "ticker", "as_of", "score_total", "score_raw",
+        "score_A_breakout", "score_B_correction",
         "score_C_ma5_position", "score_D_trend_momentum",
+        "candles_since_breakout", "avg_daily_value_B",
         "last_close", "ma5", "ma20", "breakout_date", "notes",
     ]
     out = pd.DataFrame(rows)
@@ -375,6 +474,14 @@ def main():
                          help="Format YYYY-MM-DD. Evaluasi seolah-olah tanggal itu 'hari ini' (data setelahnya "
                               "dipotong) -- untuk validasi/backtest screener terhadap contoh setup historis. "
                               "Pakai --period yang cukup panjang (mis. 1y) supaya tanggal itu tercakup.")
+    parser.add_argument("--min-value", type=float, default=None,
+                         help="Min avg value traded/hari dalam MILIAR IDR (default 1.0 = 1 miliar). "
+                              "Contoh: --min-value 2.5 untuk filter >= 2.5 miliar/hari. Set 0 untuk disable.")
+    parser.add_argument("--min-price", type=float, default=None,
+                         help="Min harga last close dalam IDR (default 50). Set 0 untuk disable.")
+    parser.add_argument("--min-volume", type=float, default=None,
+                         help="Min avg volume/hari dalam JUTA lembar saham (default 0 = off). "
+                              "Contoh: --min-volume 1 untuk filter >= 1 juta lembar/hari.")
     args = parser.parse_args()
 
     if args.tickers:
@@ -391,7 +498,20 @@ def main():
         return
 
     cfg = ScoringConfig()
-    print(f"Mengambil & menskor {len(tickers)} ticker dari yfinance (period={args.period}, interval={args.interval})...")
+    # Override liquidity threshold dari CLI kalau ada
+    if args.min_value is not None:
+        cfg.MIN_AVG_VALUE = args.min_value * 1_000_000_000
+    if args.min_price is not None:
+        cfg.MIN_PRICE = args.min_price
+    if args.min_volume is not None:
+        cfg.MIN_AVG_VOLUME = args.min_volume * 1_000_000
+
+    liq_info = (f"value>={cfg.MIN_AVG_VALUE/1e9:.1f}M/hari, "
+                f"price>={cfg.MIN_PRICE:.0f}, "
+                f"vol>={cfg.MIN_AVG_VOLUME/1e6:.0f}jt/hari")
+    print(f"Mengambil & menskor {len(tickers)} ticker dari yfinance "
+          f"(period={args.period}, interval={args.interval})...")
+    print(f"Liquidity filter: {liq_info}")
     results = screen_universe(tickers, args.lookback, cfg, period=args.period,
                                interval=args.interval, sleep=args.sleep, as_of=args.as_of)
 
