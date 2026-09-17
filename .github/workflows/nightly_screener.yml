@@ -58,9 +58,9 @@ jobs:
         run: |
           git config user.name "idx-screener-bot"
           git config user.email "actions@users.noreply.github.com"
+          git pull --rebase origin main
           mkdir -p results/history
           cp results/latest.csv "results/history/$(date -u +'%Y-%m-%d').csv"
           git add results/latest.csv results/history/
           git commit -m "Update screener results $(date -u +'%Y-%m-%d')" || echo "Tidak ada perubahan untuk di-commit"
-          git pull --rebase origin main
           git push
