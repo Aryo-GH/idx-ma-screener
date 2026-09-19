@@ -172,9 +172,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Body"] = (df["Close"] - df["Open"]).abs()
     df["AvgBody20"] = df["Body"].rolling(20).mean()
     df["AvgVol20"] = df["Volume"].rolling(20).mean()
-    # yfinance mengembalikan volume IDX (.JK) dalam LOT (1 lot = 100 lembar),
-    # bukan dalam lembar saham. Kalikan 100 supaya value IDR-nya akurat.
-    df["Value"] = df["Close"] * df["Volume"] * 100     # value traded per candle (IDR)
+    df["Value"] = df["Close"] * df["Volume"]             # value traded per candle (IDR)
     df["AvgValue20"] = df["Value"].rolling(20).mean()  # rata-rata 20 candle
     df["StochK"], df["StochD"] = _stoch_rsi(df["Close"])
     return df
@@ -455,27 +453,90 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
 # ---------------------------------------------------------------------------
 # Screening seluruh universe (via yfinance)
 # ---------------------------------------------------------------------------
+def _batch_download(symbols: list[str], period: str, interval: str) -> dict[str, pd.DataFrame]:
+    """Download semua ticker sekaligus (satu request) pakai yfinance.download().
+
+    Jauh lebih cepat dari satu-per-satu dan tidak kena rate-limit Yahoo Finance.
+    Return dict {ticker_upper: DataFrame(OHLCV)}.
+    """
+    import yfinance as yf
+
+    # yfinance.download untuk banyak ticker mengembalikan MultiIndex columns
+    raw = yf.download(
+        tickers=symbols,
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
+
+    result: dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return result
+
+    # Kalau hanya 1 ticker, columns tidak pakai MultiIndex
+    if len(symbols) == 1:
+        sym = symbols[0].upper()
+        df = raw.rename(columns=str.title)
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if all(c in df.columns for c in required):
+            result[sym] = df[required].astype(float).dropna(how="all")
+        return result
+
+    for sym in symbols:
+        try:
+            df = raw[sym].copy()
+            df.columns = [c.title() for c in df.columns]
+            required = ["Open", "High", "Low", "Close", "Volume"]
+            if not all(c in df.columns for c in required):
+                continue
+            df = df[required].astype(float).dropna(how="all")
+            if not df.empty:
+                result[sym.upper()] = df
+        except (KeyError, AttributeError):
+            pass
+
+    return result
+
+
 def screen_universe(tickers: list[str], lookback: int, cfg: ScoringConfig,
                      period: str = "6mo", interval: str = "1d",
                      sleep: float = 0.0, as_of: str | None = None) -> pd.DataFrame:
+    """Screen semua ticker.
+
+    Menggunakan batch download (satu request untuk semua ticker) untuk menghindari
+    rate-limit Yahoo Finance saat screening 500+ saham sekaligus.
+    Parameter `sleep` tetap ada untuk kompatibilitas tapi tidak dipakai di batch mode.
+    """
     rows = []
     cutoff = pd.Timestamp(as_of) if as_of else None
-    for ticker in tickers:
+
+    # Normalisasi ke format Yahoo (.JK) dan buat mapping balik ke nama asli
+    symbols = [to_yahoo_symbol(t) for t in tickers]
+    print(f"Batch download {len(symbols)} ticker dari yfinance...")
+    data_map = _batch_download(symbols, period, interval)
+    print(f"Berhasil download: {len(data_map)} ticker")
+
+    for ticker, symbol in zip(tickers, symbols):
+        sym_upper = symbol.upper()
+        raw_df = data_map.get(sym_upper)
+        if raw_df is None or raw_df.empty:
+            print(f"[error] {ticker}: tidak ada data dari yfinance")
+            continue
         try:
-            raw_df = load_ohlc_yf(ticker, period=period, interval=interval)
             if cutoff is not None:
-                raw_df = raw_df[raw_df.index.tz_localize(None) <= cutoff] if raw_df.index.tz is not None \
-                    else raw_df[raw_df.index <= cutoff]
+                idx = raw_df.index.tz_localize(None) if raw_df.index.tz is not None else raw_df.index
+                raw_df = raw_df[idx <= cutoff]
                 if raw_df.empty:
                     print(f"[skip] {ticker}: tidak ada data pada/sebelum {as_of}")
                     continue
             result = score_stock(raw_df, cfg, lookback)
             if result is None:
-                # Bisa karena data pendek ATAU tidak liquid -- cek dulu panjang data
                 if len(raw_df) < cfg.MIN_HISTORY:
                     print(f"[skip] {ticker}: data kurang ({len(raw_df)} candle)")
                 else:
-                    # Hitung ulang untuk dapat pesan liquidity
                     df_tmp = compute_indicators(raw_df)
                     _, liq_msg = check_liquidity(df_tmp, cfg)
                     print(f"[skip] {ticker}: {liq_msg}")
@@ -483,10 +544,8 @@ def screen_universe(tickers: list[str], lookback: int, cfg: ScoringConfig,
             result["ticker"] = ticker.upper()
             result["as_of"] = raw_df.index[-1].date().isoformat()
             rows.append(result)
-        except Exception as exc:  # noqa: BLE001 -- 1 ticker error tidak boleh menghentikan seluruh screening
+        except Exception as exc:  # noqa: BLE001
             print(f"[error] {ticker}: {exc}")
-        if sleep > 0:
-            time.sleep(sleep)
 
     if not rows:
         return pd.DataFrame()
