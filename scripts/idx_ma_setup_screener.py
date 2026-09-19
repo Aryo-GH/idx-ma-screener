@@ -172,7 +172,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Body"] = (df["Close"] - df["Open"]).abs()
     df["AvgBody20"] = df["Body"].rolling(20).mean()
     df["AvgVol20"] = df["Volume"].rolling(20).mean()
-    df["Value"] = df["Close"] * df["Volume"]           # value traded per candle (IDR)
+    # yfinance mengembalikan volume IDX (.JK) dalam LOT (1 lot = 100 lembar),
+    # bukan dalam lembar saham. Kalikan 100 supaya value IDR-nya akurat.
+    df["Value"] = df["Close"] * df["Volume"] * 100     # value traded per candle (IDR)
     df["AvgValue20"] = df["Value"].rolling(20).mean()  # rata-rata 20 candle
     df["StochK"], df["StochD"] = _stoch_rsi(df["Close"])
     return df
