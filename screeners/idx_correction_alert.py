@@ -296,33 +296,32 @@ def screen(tickers: list[str], cfg: AlertConfig) -> list[dict]:
 def format_telegram_msg(hits: list[dict], total: int) -> str:
     from datetime import date
 
-    today = date.today().strftime("%-d %B %Y")
+    today = date.today().strftime("%-d %b %Y")
     lines = [
         f"📉 *CORRECTION ALERT* — {today}",
-        f"Pola: koreksi orderly + volume turun + Stoch RSI oversold",
-        f"Kandidat: *{len(hits)}* dari {total} saham discreen\n",
+        f"Koreksi orderly · vol turun · Stoch RSI oversold",
+        f"*{len(hits)}* kandidat dari {total} saham\n",
     ]
 
-    for h in hits:
-        dd   = h["drawdown_pct"]
-        vr   = h["vol_ratio_pct"]
-        rng  = h["range_5d_pct"]
-        sk   = h["stoch_k"]
-        ma20 = h["pct_above_ma20"]
-        dsp  = h["days_since_peak"]
-        av   = h["avg_value_b"]
-
-        # Tanda visual
-        vol_bar = "🟢" if vr < 45 else "🟡"
-        rsi_bar = "🟢" if sk < 15 else "🟡"
-
-        lines.append(
-            f"*{h['ticker']}*  Rp{h['close']:.0f}  ({ma20:+.1f}% vs MA20)\n"
-            f"  ↘ {dd:.1f}% off peak ({dsp}d lalu)  •  {vol_bar} Vol {vr:.0f}% avg\n"
-            f"  📊 Range 5d {rng:.1f}%  •  {rsi_bar} StochK {sk:.1f}  •  💧 {av:.1f}M/hari"
-        )
-
-    if not hits:
+    if hits:
+        # Header tabel
+        hdr = f"{'Ticker':<6} {'Harga':>6} {'K':>5} {'Vol':>4} {'Rng':>5} {'MA20':>6}"
+        sep = "─" * len(hdr)
+        rows = [hdr, sep]
+        for h in hits:
+            rows.append(
+                f"{h['ticker']:<6} {h['close']:>6.0f} "
+                f"{h['stoch_k']:>4.1f} "
+                f"{h['vol_ratio_pct']:>3.0f}% "
+                f"{h['range_5d_pct']:>4.1f}% "
+                f"{h['pct_above_ma20']:>+5.1f}%"
+            )
+        # Kirim sebagai code block agar monospace & rapi
+        lines.append("```")
+        lines.extend(rows)
+        lines.append("```")
+        lines.append("_K=StochRSI · Vol=avg5/20 · Rng=range5d · MA20=jarak_")
+    else:
         lines.append("_Tidak ada kandidat hari ini._")
 
     return "\n".join(lines)
