@@ -1,0 +1,33 @@
+name: Nightly Correction Alert
+
+on:
+  schedule:
+    # 12:00 UTC = 19:00 WIB, Senin–Jumat
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch:   # bisa dipicu manual dari GitHub atau HP
+
+jobs:
+  correction-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install yfinance pandas --quiet
+
+      - name: Run Correction Low Volume Alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python screeners/idx_correction_alert.py \
+            --tickers-file data/idx_universe.txt \
+            --telegram
