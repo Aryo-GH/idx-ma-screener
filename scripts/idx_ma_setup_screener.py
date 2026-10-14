@@ -36,6 +36,7 @@ CONTOH PAKAI
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,7 +173,9 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Body"] = (df["Close"] - df["Open"]).abs()
     df["AvgBody20"] = df["Body"].rolling(20).mean()
     df["AvgVol20"] = df["Volume"].rolling(20).mean()
-    df["Value"] = df["Close"] * df["Volume"]             # value traded per candle (IDR)
+    # Value: gunakan kolom "Value" dari Arjum (sudah IDR), fallback hitung Close×Volume
+    if "Value" not in df.columns:
+        df["Value"] = df["Close"] * df["Volume"]
     df["AvgValue20"] = df["Value"].rolling(20).mean()  # rata-rata 20 candle
     df["StochK"], df["StochD"] = _stoch_rsi(df["Close"])
     return df
@@ -409,10 +412,11 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
     if pd.notna(last["MA20"]) and last["Close"] < last["MA20"]:
         return None
 
-    # Gate "fanning out" #2: MA5 harus jelas di atas MA20 (min 1% separation).
+    # Gate "fanning out" #2: MA5 harus jelas di atas MA20 (min 2% separation).
     # MA5 yang hampir sama dengan MA20 berarti MAs belum "fanning out" --
     # bisa jadi saham masih di tengah downtrend panjang (catches PGEO).
-    if pd.notna(last["MA5"]) and pd.notna(last["MA20"]) and last["MA5"] < last["MA20"] * 1.01:
+    # 2% dipilih supaya PGEO (MA5/MA20 ratio ~1.0096) tertangkap dengan lebih meyakinkan.
+    if pd.notna(last["MA5"]) and pd.notna(last["MA20"]) and last["MA5"] < last["MA20"] * 1.02:
         return None
 
     breakout_idx = find_breakout(df, lookback, cfg)
@@ -453,51 +457,137 @@ def score_stock(raw_df: pd.DataFrame, cfg: ScoringConfig, lookback: int):
 # ---------------------------------------------------------------------------
 # Screening seluruh universe (via yfinance)
 # ---------------------------------------------------------------------------
-def _batch_download(symbols: list[str], period: str, interval: str) -> dict[str, pd.DataFrame]:
-    """Download semua ticker sekaligus (satu request) pakai yfinance.download().
+def _batch_download(symbols: list[str], period: str, interval: str,
+                    chunk_size: int = 200) -> dict[str, pd.DataFrame]:
+    """Download ticker dalam chunk supaya tidak timeout / partial result.
 
-    Jauh lebih cepat dari satu-per-satu dan tidak kena rate-limit Yahoo Finance.
-    Return dict {ticker_upper: DataFrame(OHLCV)}.
+    Mengirim maksimal `chunk_size` ticker per request ke Yahoo Finance.
+    Lebih cepat dari satu-per-satu dan tidak kena rate-limit.
+    Return dict {TICKER.JK_UPPER: DataFrame(OHLCV)}.
     """
     import yfinance as yf
 
-    # yfinance.download untuk banyak ticker mengembalikan MultiIndex columns
-    raw = yf.download(
-        tickers=symbols,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
+    result: dict[str, pd.DataFrame] = {}
+
+    # Bagi ke chunk
+    chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+    print(f"  → {len(symbols)} ticker dibagi {len(chunks)} chunk (@{chunk_size})")
+
+    for idx, chunk in enumerate(chunks):
+        print(f"  → Download chunk {idx + 1}/{len(chunks)} ({len(chunk)} ticker)...")
+        # Pakai start/end explicit supaya yfinance selalu ambil data hari ini
+        # (period="3mo" kadang lag 1-2 hari untuk saham non-US)
+        import datetime as _dt
+        _today = _dt.date.today()
+        _end   = (_today + _dt.timedelta(days=1)).isoformat()
+        _period_days = {"1mo": 35, "2mo": 65, "3mo": 100, "6mo": 190,
+                        "1y": 370, "2y": 740, "60d": 65, "90d": 95}
+        _start = (_today - _dt.timedelta(days=_period_days.get(period, 100))).isoformat()
+        try:
+            raw = yf.download(
+                tickers=chunk,
+                start=_start,
+                end=_end,
+                interval=interval,
+                auto_adjust=False,
+                group_by="ticker",
+                threads=True,
+                progress=False,
+            )
+        except Exception as exc:
+            print(f"  [warn] Chunk {idx + 1} gagal: {exc}")
+            continue
+
+        if raw is None or raw.empty:
+            continue
+
+        # Satu ticker: kolom flat (tidak MultiIndex)
+        if len(chunk) == 1:
+            sym = chunk[0].upper()
+            df = raw.copy()
+            df.columns = [c.title() if isinstance(c, str) else c[0].title() for c in df.columns]
+            required = ["Open", "High", "Low", "Close", "Volume"]
+            if all(c in df.columns for c in required):
+                df = df[required].astype(float).dropna(how="all")
+                if not df.empty:
+                    result[sym] = df
+            continue
+
+        # Banyak ticker: MultiIndex (metric, ticker)
+        for sym in chunk:
+            try:
+                df = raw[sym].copy()
+                df.columns = [c.title() if isinstance(c, str) else str(c).title() for c in df.columns]
+                required = ["Open", "High", "Low", "Close", "Volume"]
+                if not all(c in df.columns for c in required):
+                    continue
+                df = df[required].astype(float).dropna(how="all")
+                if not df.empty:
+                    result[sym.upper()] = df
+            except (KeyError, AttributeError):
+                pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Arjum API (IDX Exchange data — jauh lebih akurat dari yfinance)
+# Aktif kalau env var ARJUM_API_KEY di-set. Fallback ke yfinance kalau tidak ada.
+# ---------------------------------------------------------------------------
+_ARJUM_BASE = "https://stock.arjum.com"
+_ARJUM_LIMIT = 200  # max 500; 200 ≈ 10 bulan hari bursa — cukup untuk MA20 + lookback
+
+
+def _arjum_fetch_one(code: str, api_key: str, limit: int = _ARJUM_LIMIT) -> pd.DataFrame | None:
+    """Ambil OHLCV + value IDR dari Arjum untuk satu kode saham (tanpa .JK)."""
+    import json
+    import urllib.request
+
+    url = f"{_ARJUM_BASE}/api/history/{code}?limit={limit}&frame=daily"
+    req = urllib.request.Request(url, headers={"X-API-Key": api_key, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return None
+
+    rows = data.get("rows")
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                             "close": "Close", "volume": "Volume", "value": "Value"})
+    needed = ["Open", "High", "Low", "Close", "Volume", "Value"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        return None
+    return df[needed].astype(float).dropna(how="all")
+
+
+def _arjum_download(tickers: list[str], api_key: str,
+                    limit: int = _ARJUM_LIMIT, max_workers: int = 30) -> dict[str, pd.DataFrame]:
+    """Download semua ticker dari Arjum API secara paralel. Return {TICKER: DataFrame}."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch(t: str):
+        return t, _arjum_fetch_one(t, api_key, limit)
 
     result: dict[str, pd.DataFrame] = {}
-    if raw is None or raw.empty:
-        return result
-
-    # Kalau hanya 1 ticker, columns tidak pakai MultiIndex
-    if len(symbols) == 1:
-        sym = symbols[0].upper()
-        df = raw.rename(columns=str.title)
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        if all(c in df.columns for c in required):
-            result[sym] = df[required].astype(float).dropna(how="all")
-        return result
-
-    for sym in symbols:
-        try:
-            df = raw[sym].copy()
-            df.columns = [c.title() for c in df.columns]
-            required = ["Open", "High", "Low", "Close", "Volume"]
-            if not all(c in df.columns for c in required):
-                continue
-            df = df[required].astype(float).dropna(how="all")
-            if not df.empty:
-                result[sym.upper()] = df
-        except (KeyError, AttributeError):
-            pass
-
+    print(f"  → Arjum API: download {len(tickers)} ticker ({max_workers} worker paralel)...")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fetch, t): t for t in tickers}
+        ok = fail = 0
+        for fut in as_completed(futures):
+            t, df = fut.result()
+            if df is not None and not df.empty:
+                result[t.upper()] = df
+                ok += 1
+            else:
+                fail += 1
+    print(f"  → Arjum: {ok} berhasil, {fail} tidak ada data / gagal")
     return result
 
 
@@ -506,24 +596,38 @@ def screen_universe(tickers: list[str], lookback: int, cfg: ScoringConfig,
                      sleep: float = 0.0, as_of: str | None = None) -> pd.DataFrame:
     """Screen semua ticker.
 
-    Menggunakan batch download (satu request untuk semua ticker) untuk menghindari
-    rate-limit Yahoo Finance saat screening 500+ saham sekaligus.
-    Parameter `sleep` tetap ada untuk kompatibilitas tapi tidak dipakai di batch mode.
+    Prioritas data: Arjum API (ARJUM_API_KEY env var) → yfinance (fallback).
+    Arjum memberikan data IDX resmi termasuk value IDR langsung per candle.
     """
     rows = []
     cutoff = pd.Timestamp(as_of) if as_of else None
 
-    # Normalisasi ke format Yahoo (.JK) dan buat mapping balik ke nama asli
-    symbols = [to_yahoo_symbol(t) for t in tickers]
-    print(f"Batch download {len(symbols)} ticker dari yfinance...")
-    data_map = _batch_download(symbols, period, interval)
-    print(f"Berhasil download: {len(data_map)} ticker")
+    arjum_key = os.environ.get("ARJUM_API_KEY", "").strip()
 
-    for ticker, symbol in zip(tickers, symbols):
-        sym_upper = symbol.upper()
-        raw_df = data_map.get(sym_upper)
+    if arjum_key:
+        # Pakai Arjum — kode tanpa .JK
+        codes = [t.replace(".JK", "").upper() for t in tickers]
+        print(f"Sumber data: Arjum API ({len(codes)} ticker)...")
+        data_map = _arjum_download(codes, arjum_key)
+        print(f"Berhasil download: {len(data_map)} ticker")
+
+        def _get_df(ticker: str) -> pd.DataFrame | None:
+            code = ticker.replace(".JK", "").upper()
+            return data_map.get(code)
+    else:
+        # Fallback yfinance
+        symbols = [to_yahoo_symbol(t) for t in tickers]
+        print(f"Sumber data: yfinance ({len(symbols)} ticker)...")
+        data_map = _batch_download(symbols, period, interval)
+        print(f"Berhasil download: {len(data_map)} ticker")
+
+        def _get_df(ticker: str) -> pd.DataFrame | None:
+            return data_map.get(to_yahoo_symbol(ticker).upper())
+
+    for ticker in tickers:
+        raw_df = _get_df(ticker)
         if raw_df is None or raw_df.empty:
-            print(f"[error] {ticker}: tidak ada data dari yfinance")
+            print(f"[skip] {ticker}: tidak ada data")
             continue
         try:
             if cutoff is not None:
