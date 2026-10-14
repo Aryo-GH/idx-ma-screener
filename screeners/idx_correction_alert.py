@@ -206,9 +206,16 @@ def _batch_download(symbols: list[str], period: str = "3mo",
 
     for idx, chunk in enumerate(chunks):
         print(f"  → Chunk {idx + 1}/{len(chunks)} ({len(chunk)} ticker)...")
+        # Pakai start/end explicit supaya yfinance selalu ambil data hari ini
+        import datetime as _dt
+        _today = _dt.date.today()
+        _end   = (_today + _dt.timedelta(days=1)).isoformat()
+        _period_days = {"1mo": 35, "2mo": 65, "3mo": 100, "6mo": 190,
+                        "1y": 370, "60d": 65, "90d": 95}
+        _start = (_today - _dt.timedelta(days=_period_days.get(period, 100))).isoformat()
         try:
             raw = yf.download(
-                tickers=chunk, period=period, interval="1d",
+                tickers=chunk, start=_start, end=_end, interval="1d",
                 auto_adjust=False, group_by="ticker",
                 threads=True, progress=False,
             )
@@ -296,9 +303,20 @@ def screen(tickers: list[str], cfg: AlertConfig) -> list[dict]:
 def format_telegram_msg(hits: list[dict], total: int) -> str:
     from datetime import date
 
-    today = date.today().strftime("%-d %b %Y")
+    # Gunakan tanggal data aktual (candle terakhir) jika ada, fallback ke hari ini
+    if hits:
+        data_date = hits[0].get("as_of", date.today().isoformat())
+        try:
+            from datetime import datetime
+            d = datetime.strptime(data_date, "%Y-%m-%d")
+            date_str = d.strftime("%-d %b %Y")
+        except Exception:
+            date_str = data_date
+    else:
+        date_str = date.today().strftime("%-d %b %Y")
+
     lines = [
-        f"📉 *CORRECTION ALERT* — {today}",
+        f"📉 *CORRECTION ALERT* — {date_str}",
         f"Koreksi orderly · vol turun · Stoch RSI oversold",
         f"*{len(hits)}* kandidat dari {total} saham\n",
     ]
